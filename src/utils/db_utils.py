@@ -1,6 +1,6 @@
 from typing import List, Union, Type, Dict, Optional
 from config.logger import setup_logger
-from peewee import Database, Model, UUIDField
+from peewee import Database, Model, UUIDField, ForeignKeyField, SQL
 import pandas as pd
 import polars as pl
 from config.settings import settings
@@ -10,16 +10,6 @@ import uuid
 logger = setup_logger(__name__)
 
 def check_tables_exist(tables: List[str]) -> None:
-    """
-    Проверяет существование и доступность таблиц в указанной схеме базы данных (Peewee).
-
-    Args:
-        tables (List[str]): Список имен таблиц для проверки.
-
-    Raises:
-        ValueError: Если какая-либо таблица не существует или недоступна.
-        Exception: При любых других ошибках доступа к базе данных.
-    """
     try:
         schema = getattr(settings, 'psql_schema', 'public')
         with db.connection_context():
@@ -39,30 +29,14 @@ def check_tables_exist(tables: List[str]) -> None:
         raise
 
 def get_record_id(model: Type[Model], conditions: Dict[str, any]) -> str:
-    """
-    Универсальная функция для поиска ID записи в модели по заданным условиям.
-
-    Args:
-        model (Type[Model]): Модель Peewee, в которой выполняется поиск.
-        conditions (Dict[str, any]): Словарь условий для поиска (ключ - имя поля, значение - значение поля).
-
-    Returns:
-        str: ID найденной записи.
-
-    Raises:
-        ValueError: Если условия недействительны или запись не найдена.
-        Exception: При ошибках доступа к базе данных.
-    """
     try:
         schema = getattr(settings, 'psql_schema', 'public')
         
-        # Проверка условий
         if not conditions or not all(k in model._meta.fields and conditions[k] is not None for k in conditions):
             invalid_fields = [k for k in conditions if k not in model._meta.fields or conditions[k] is None]
             logger.error(f"Invalid or missing conditions: {invalid_fields}")
             raise ValueError(f"Invalid or missing conditions: {invalid_fields}")
 
-        # Формируем запрос
         query_conditions = [getattr(model, field) == value for field, value in conditions.items()]
         with db.connection_context():
             cursor = db.execute_sql("SHOW search_path")
@@ -79,118 +53,87 @@ def get_record_id(model: Type[Model], conditions: Dict[str, any]) -> str:
             record_id = str(record.id)
             logger.debug(f"Found record_id: {record_id} for conditions: {conditions}")
             return record_id
-
     except Exception as e:
-        logger.error(f"Failed to get record from {model._meta.table_name} with conditions {conditions}: {str(e)}")
+        logger.error(f"Failed to get record from {model._meta.table_name} with conditions: {conditions}: {str(e)}")
         raise
 
-def bulk_insert(model: Type[Model], data: Union[pd.DataFrame, pl.DataFrame], batch_size: int = 500) -> None:
-    """
-    Универсальная функция для массовой вставки или обновления записей в таблицу базы данных (Peewee).
-
-    Args:
-        model (Type[Model]): Модель Peewee, соответствующая таблице.
-        data (Union[pd.DataFrame, pl.DataFrame]): Данные для вставки (Pandas или Polars DataFrame).
-        batch_size (int): Размер пакета для обработки (по умолчанию 500).
-
-    Raises:
-        ValueError: Если DataFrame пустой или отсутствуют обязательные поля.
-        Exception: При ошибках вставки/обновления.
-    """
+def bulk_insert(model: Type[Model], data: Union[pd.DataFrame, pl.DataFrame], batch_size: int = 500, update_fields: Optional[List[str]] = None) -> None:
     if isinstance(data, pd.DataFrame) and data.empty or isinstance(data, pl.DataFrame) and data.is_empty():
-        logger.warning("DataFrame is empty, no data to import")
+        logger.warning("DataFrame empty, no data to import")
         return
 
     try:
         schema = getattr(settings, 'psql_schema', 'public')
         skipped_rows = 0
-        updated_rows = 0
-        inserted_rows = 0
+        processed_rows = 0
 
-        # Определяем обязательные поля модели
-        required_fields = [field.name for field in model._meta.fields.values() if not field.null and not field.default]
-        if isinstance(model._meta.fields.get('id'), UUIDField) and 'id' not in required_fields:
-            required_fields.append('id')
+        # Define required fields, excluding ForeignKeyField
+        required_fields = [field.name for field in model._meta.fields.values() if not field.null and not field.default and not isinstance(field, (UUIDField, ForeignKeyField))]
+        model_fields = set(model._meta.fields.keys())
+        logger.debug(f"Model fields: {model_fields}, Required fields: {required_fields}")
 
-        # Определяем поля уникального индекса (если есть)
+        # Determine unique index fields
         unique_fields = []
         for index in model._meta.indexes:
-            if index[1]:  # Проверяем, является ли индекс уникальным
-                unique_fields = [field for field in index[0] if isinstance(field, str)]
+            if index[1]:  # Check if index is unique
+                unique_fields = [field if isinstance(field, str) else field.name for field in index[0]]
                 break
+        if not unique_fields and hasattr(model._meta, 'constraints'):
+            for constraint in model._meta.constraints:
+                if 'UNIQUE' in str(constraint).upper():
+                    constraint_str = str(constraint).lower()
+                    fields = [f.strip() for f in constraint_str.split('(')[1].split(')')[0].split(',')]
+                    unique_fields = [f for f in fields if f in model_fields]
+                    break
         if not unique_fields:
-            logger.warning("No unique index found; updates will not be performed, only inserts")
-            unique_fields = []
+            logger.error("No unique index or constraint found for model")
+            raise ValueError("No unique index or constraint defined for model")
 
-        # Преобразуем данные в список словарей
+        logger.debug(f"Using unique fields for upsert: {unique_fields}")
+
+        # Define update fields, excluding ForeignKeyField
+        if update_fields:
+            update_fields = [field for field in update_fields if field in model_fields and field not in unique_fields + ['id'] and not isinstance(model._meta.fields[field], ForeignKeyField)]
+            if not update_fields:
+                logger.error("No valid update fields provided")
+                raise ValueError("No valid update fields provided")
+        else:
+            update_fields = [field for field in model_fields if field not in unique_fields + ['id'] and not isinstance(model._meta.fields[field], ForeignKeyField)]
+        logger.debug(f"Update fields: {update_fields}")
+
+        # Convert data to list of dictionaries
         data_list = data.to_dict('records') if isinstance(data, pd.DataFrame) else data.to_dicts()
-
-        # Фильтруем записи с отсутствующими обязательными полями
         valid_data = []
         for row in data_list:
-            if all(field in row and row[field] is not None for field in required_fields):
-                valid_data.append(row)
-            else:
-                logger.warning(f"Skipping row with missing required fields: {row}")
+            missing_fields = [field for field in required_fields if field not in row or row[field] is None]
+            if missing_fields:
+                logger.warning(f"Skipping row with missing required fields {missing_fields}: {row}")
                 skipped_rows += 1
+                continue
+            if 'project' not in row or row['project'] is None:
+                logger.warning(f"Skipping row with null project: {row}")
+                skipped_rows += 1
+                continue
+            valid_data.append({field: row[field] for field in row if field in model_fields})
 
         if not valid_data:
             logger.warning("No valid rows to insert after validation")
             return
 
         with db.connection_context():
-            # Получаем существующие записи, если есть уникальные поля
-            existing_records = {}
-            if unique_fields:
-                # Извлекаем уникальные комбинации ключей
-                keys = {tuple(row.get(field) for field in unique_fields) for row in valid_data if all(field in row for field in unique_fields)}
-                if keys:
-                    query_conditions = []
-                    for i, field in enumerate(unique_fields):
-                        field_values = [k[i] for k in keys]
-                        query_conditions.append(getattr(model, field).in_(field_values))
-                    existing_query = model.select(model.id, *unique_fields).where(*query_conditions)
-                    existing_records = {
-                        tuple(getattr(rec, field) for field in unique_fields): rec.id
-                        for rec in existing_query
-                    }
-
-            # Разделяем данные на вставку и обновление
-            insert_data = []
-            update_data = []
-            for row in valid_data:
-                row_key = tuple(row.get(field) for field in unique_fields) if unique_fields else None
-                if unique_fields and row_key in existing_records:
-                    update_data.append({
-                        'id': existing_records[row_key],
-                        **{field: row[field] for field in row if field in model._meta.fields and field not in unique_fields + ['id']}
-                    })
-                else:
-                    insert_row = {field: row[field] for field in row if field in model._meta.fields}
-                    if 'id' not in insert_row and isinstance(model._meta.fields.get('id'), UUIDField):
-                        insert_row['id'] = uuid.uuid4()
-                    insert_data.append(insert_row)
-
-            # Массовая вставка
-            if insert_data:
-                for i in range(0, len(insert_data), batch_size):
-                    batch = insert_data[i:i + batch_size]
-                    model.insert_many(batch).execute()
-                    inserted_rows += len(batch)
-                    logger.debug(f"Inserted {len(batch)} records in batch")
-
-            # Массовая обновление
-            if update_data:
-                for i in range(0, len(update_data), batch_size):
-                    batch = update_data[i:i + batch_size]
-                    for row in batch:
-                        model.update(**{k: v for k, v in row.items() if k != 'id'}).where(model.id == row['id']).execute()
-                        updated_rows += 1
-                    logger.debug(f"Updated {len(batch)} records in batch")
+            for i in range(0, len(valid_data), batch_size):
+                batch = valid_data[i:i + batch_size]
+                query = model.insert_many(batch).on_conflict(
+                    conflict_target=unique_fields,
+                    update={field: SQL(f'EXCLUDED.{field}') for field in update_fields}
+                )
+                result = query.execute()
+                processed_rows += len(batch)
+                logger.debug(f"Processed {len(batch)} records in batch (inserted or updated)")
 
         logger.info(f"Skipped {skipped_rows} rows due to errors or missing fields")
-        logger.info(f"Inserted {inserted_rows} new records")
-        logger.info(f"Updated {updated_rows} existing records")
+        logger.info(f"Processed {processed_rows} records (inserted or updated)")
+        logger.info("Note: Exact insert/update counts may vary due to upsert operation")
     except Exception as e:
         logger.error(f"Failed to insert/update records: {str(e)}")
         raise

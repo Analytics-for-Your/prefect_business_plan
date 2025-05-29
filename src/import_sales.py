@@ -2,13 +2,15 @@ import os
 import pandas as pd
 import polars as pl
 import uuid
-from database.models import ProjectModel
+from database.models import ProjectModel, SalesModel
 from config.logger import setup_logger
 from config.settings import settings
 from utils.time_utils import parse_date_dynamic
 from utils.files_utils import get_all_files, read_excel_file_polars
 from utils.df_utils import detect_date_columns, clean_negative_values
+from utils.db_utils import check_tables_exist, bulk_insert, get_record_id
 from typing import List, Union
+from database.db import db
 
 logger = setup_logger(__name__)
 
@@ -37,16 +39,12 @@ FIELD_TYPES = {
 }
 
 # Aggregation and validation fields
-AGGREGATION_FIELDS = ["project", "segment", "date_of_month_begin", "data_fields"]
+AGGREGATION_FIELDS = ["project_id", "segment", "date_of_month_begin", "data_fields"]
 
 # Fields for data metrics (matches SalesModel fields)
 DATA_FIELDS = ["total_gs", "total_ewc", "total_gm"]
 
 NEGATIVE_CLEAN_COLUMNS = ["value"]
-
-def mock_get_record_id(model, conditions: dict) -> str:
-    logger.debug(f"Mocked get_record_id for model {model.__name__} with conditions {conditions}")
-    return str(uuid.uuid4())
 
 def cast_column_types(df: Union[pd.DataFrame, pl.DataFrame]) -> Union[pd.DataFrame, pl.DataFrame]:
     try:
@@ -63,16 +61,6 @@ def cast_column_types(df: Union[pd.DataFrame, pl.DataFrame]) -> Union[pd.DataFra
         raise
 
 def aggregate_sales_data(df: pl.DataFrame, date_columns: List[str]) -> pl.DataFrame:
-    """
-    Transform wide-format DataFrame to long format using Polars unpivot, relying on global variables.
-    
-    Args:
-        df: Input Polars DataFrame in wide format.
-        date_columns: List of date columns.
-    
-    Returns:
-        Polars DataFrame with columns defined in AGGREGATION_FIELDS plus 'value'.
-    """
     try:
         required_cols = list(FIELD_MAPPING.keys())
         missing_cols = [col for col in required_cols if col not in df.columns]
@@ -80,30 +68,46 @@ def aggregate_sales_data(df: pl.DataFrame, date_columns: List[str]) -> pl.DataFr
             logger.error(f"Missing required columns: {missing_cols}")
             raise ValueError(f"Missing required columns: {missing_cols}")
 
+        # Filter out rows with null or empty required columns
         filter_conditions = [
-            (~pl.col(col).is_null()) & (pl.col(col) != "None")
+            (~pl.col(col).is_null()) & (pl.col(col).cast(pl.Utf8) != "") & (pl.col(col) != "None")
             for col in required_cols
         ]
         df = df.filter(pl.all_horizontal(*filter_conditions))
         logger.info(f"Filtered to {len(df)} valid rows")
 
         if ID_FIELDS:
-            project_conditions = [
-                col for col in ID_FIELDS if col in df.columns
-            ]
+            project_conditions = [col for col in ID_FIELDS if col in df.columns]
             if not project_conditions:
-                logger.error(f"None of the project ID fields {ID_FIELDS} found in DataFrame")
+                logger.error(f"None of project ID fields {ID_FIELDS} found in DataFrame")
                 raise ValueError(f"Missing project ID fields: {ID_FIELDS}")
+
+            def fetch_project_id(row: dict) -> str:
+                conditions = {field: row[field] for field in project_conditions}
+                # Skip rows with empty or null conditions
+                if not all(v and v != "None" for v in conditions.values()):
+                    logger.warning(f"Skipping row with invalid project conditions: {conditions}")
+                    return None
+                try:
+                    project_id = get_record_id(ProjectModel, conditions)
+                    logger.debug(f"Fetched project_id: {project_id} for conditions: {conditions}")
+                    return project_id
+                except ValueError:
+                    with db.connection_context():
+                        project = ProjectModel.create(**conditions)
+                        logger.info(f"Created new project: {conditions} with id: {project.id}")
+                        return str(project.id)
 
             df = df.with_columns(
                 pl.struct(project_conditions).map_elements(
-                    lambda x: mock_get_record_id(
-                        ProjectModel,
-                        {field: x[field] or "USD" if field == "currency" else x[field] for field in project_conditions}
-                    ),
+                    fetch_project_id,
                     return_dtype=pl.Utf8
-                ).alias("project")
+                ).alias("project_id")
             )
+            # Filter out rows with null project_id
+            initial_len = len(df)
+            df = df.filter(pl.col("project_id").is_not_null())
+            logger.info(f"Filtered out {initial_len - len(df)} rows with null project_id")
         else:
             logger.warning("No ID_FIELDS defined; skipping project ID mapping")
 
@@ -138,8 +142,6 @@ def aggregate_sales_data(df: pl.DataFrame, date_columns: List[str]) -> pl.DataFr
 
         df_long = df_long.group_by(AGGREGATION_FIELDS).agg(
             pl.col("value").sum()
-        ).filter(
-            pl.col("value") != 0.0
         )
 
         logger.info(f"Aggregated data to {len(df_long)} rows")
@@ -150,15 +152,6 @@ def aggregate_sales_data(df: pl.DataFrame, date_columns: List[str]) -> pl.DataFr
         raise
 
 def transform_to_model_format(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Transform aggregated DataFrame to model format using global variables.
-    
-    Args:
-        df: Input Polars DataFrame with columns defined in AGGREGATION_FIELDS plus 'value'.
-    
-    Returns:
-        Polars DataFrame with columns: id, AGGREGATION_FIELDS (excluding parameter field), and DATA_FIELDS.
-    """
     try:
         if df.is_empty():
             logger.warning("Empty DataFrame provided for transformation")
@@ -191,15 +184,15 @@ def transform_to_model_format(df: pl.DataFrame) -> pl.DataFrame:
             )
 
         model_df = model_df.with_columns(
-            pl.lit(str(uuid.uuid4())).alias("id")
+            pl.Series([str(uuid.uuid4()) for _ in range(len(model_df))]).alias("id")
         ).select([
             "id",
-            *[col for col in AGGREGATION_FIELDS if col != parameter_field],
+            pl.col("project_id").alias("project"),  # Rename to match SalesModel field
+            *[col for col in AGGREGATION_FIELDS if col != parameter_field and col != "project_id"],
             *DATA_FIELDS
         ])
 
-        # Final deduplication
-        group_by_fields = [col for col in AGGREGATION_FIELDS if col != parameter_field]
+        group_by_fields = ["project", "segment", "date_of_month_begin"]
         model_df = model_df.group_by(group_by_fields).agg([
             pl.col("id").first(),
             *[pl.col(field).sum().fill_null(0.0).fill_nan(0.0).alias(field) for field in DATA_FIELDS]
@@ -218,6 +211,8 @@ def main_job(excel_file: str) -> pl.DataFrame:
         return pl.DataFrame()
 
     try:
+        check_tables_exist([SalesModel._meta.table_name, ProjectModel._meta.table_name])
+
         df = read_excel_file_polars(excel_file, SHEET_NAME)
         logger.debug(f"Raw DataFrame:\n{df.head().to_pandas().to_string()}")
 
@@ -236,6 +231,12 @@ def main_job(excel_file: str) -> pl.DataFrame:
 
         df = transform_to_model_format(df)
         logger.debug(f"After transform_to_model_format:\n{df.to_pandas().to_string()}")
+
+        if not df.is_empty():
+            bulk_insert(SalesModel, df, batch_size=BATCH_SIZE)
+            logger.info(f"Inserted/updated {len(df)} rows into SalesModel table")
+        else:
+            logger.warning("No data to insert into database")
 
         logger.info(f"Processed {len(df)} rows after transformation")
         return df
