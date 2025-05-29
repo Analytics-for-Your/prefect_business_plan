@@ -135,6 +135,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.xlsx
+*.xlsx
 
 # Spyder project settings
 .spyderproject
@@ -172,3 +174,16 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.csv
+.DS_Store
+
+*.DS_Store
+
+*.txt
+.txt
+src/data_analysis_report.txt
+# Игнорировать папку .vscode
+.vscode/
+# Другие игнорируемые файлы
+*.log
+node_modules/
